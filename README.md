@@ -1,10 +1,8 @@
 # Apollo 11 AGC LGYRO Lock Leak Bug Reproducer
 
-Reproduces a 57-year-old undiscovered bug in the Apollo 11 Lunar Module
-flight software (Luminary099), using the [Virtual AGC](https://github.com/virtualagc/virtualagc)
-emulator running the original code.
+Based on the analysis in ["A Bug on the Dark Side of the Moon"](https://deploy-preview-248--juxt-website.netlify.app/blog/a-bug-on-the-dark-side-of-the-moon/), this repository reproduces a 57-year-old undiscovered bug in the Apollo 11 Lunar Module
+flight software (Luminary099), using the [Virtual AGC](https://github.com/virtualagc/repositoryreproduces emulator running the original code.
 
-Based on the analysis in ["A Bug on the Dark Side of the Moon"](https://deploy-preview-248--juxt-website.netlify.app/blog/a-bug-on-the-dark-side-of-the-moon/).
 
 ## The Bug
 
