@@ -67,32 +67,128 @@ python3 reproduce_lgyro_bug.py
   Luminary099 -- Apollo 11 Lunar Module
 ================================================================
 
+  Phase 0: Start yaAGC with Luminary099 flight software
+  ----------------------------------------------------------
+    [OK   ] yaAGC running in debug mode
+
   Phase 1: Boot AGC and verify initial state
-     ✓ [PASS] LGYRO starts at 0 (gyro lock is free)
+  ----------------------------------------------------------
+    [OK   ] Stepped 5000 MCTs through FRESH START
+    [READ ] LGYRO = 0o0
+  ✓ [PASS ] LGYRO starts at 0 (gyro lock is free)
+
+  Phase 2: Set up pre-conditions for the bug scenario
+  ----------------------------------------------------------
+    [INFO ] Scenario: IMUPULSE has just acquired the LGYRO lock
+    [INFO ] and scheduled STRTGYRO to torque the gyros.
+    [INFO ] Then the crew accidentally bumps the IMU cage switch.
+    [SET  ] LGYRO = 0o6001 (lock acquired by IMUPULSE)
+    [SET  ] IMODES30 = 0o40 (bit 6: IMU CAGED)
+    [SET  ] MODECADR = 0o100 (job waiting for completion)
+    [SET  ] Z -> STRTGYRO (bank 07, offset 3405)
 
   Phase 3: Execute STRTGYRO -> CAGETEST -> BADEND (the bug path)
-       503 STRTGYRO  CS   GDESELCT
-       507           TC   CAGETEST
-   >>> 703 CAGETEST  CAF  BIT6
-       704           MASK IMODES30
-       706           TCF  IMUBAD
-   >>> 700 IMUBAD    CAF  ZERO
-       701           TCF  BADEND
-   >>> 728 BADEND    TS   RUPTREG2
-       ...
-   >>> 746           XCH  MODECADR    # clears MODECADR
-       747           TC   JOBWAKE     # ... but LGYRO untouched!
+  ----------------------------------------------------------
+    [INFO ] Stepping through original Luminary099 code...
+
+               --- entered STRTGYRO (IMU_MODE_SWITCHING_ROUTINES.agc) ---
+           504 EXTEND
+           505 WAND	CHAN14
+           507 TC	CAGETEST
+      >>>  703 CAGETEST	CAF	BIT6		# SUBROUTINE TO TERMINATE IMU MODE
+           704 MASK	IMODES30	# SWITCH IF IMU HAS BEEN CAGED.
+           705 CCS	A
+      >>>  706 TCF	IMUBAD		# DIRECTLY.
+      >>>  700 IMUBAD		CAF	ZERO
+           701 TCF	BADEND
+      >>>  728 BADEND		TS	RUPTREG2	# DEVICE INDEX.
+           729 CS	ZERO		# FOR FAILURE.
+           730 TCF	GOODEND +2
+           735 TS	RUPTREG3
+           736 INDEX	RUPTREG2	# SEE IF USING PROGRAM ASLEEP.
+      >>>  737 CCS	MODECADR
+           738 TCF	+4		# YES - WAKE IT UP.
+           744 CAF	ZERO		# WAKE SLEEPING PROGRAM.
+           745 INDEX	RUPTREG2
+      >>>  746 XCH	MODECADR
+           747 TC	JOBWAKE
+
 
   Phase 4: Inspect state after BADEND completes
-     ✓ [PASS] MODECADR cleared by BADEND (job woken with failure)
-     ✓ [PASS] LGYRO = 0o6001 -- NOT cleared by BADEND (THE BUG)
+  ----------------------------------------------------------
+    [READ ] MODECADR = 0o0
+  ✓ [PASS ] MODECADR cleared by BADEND (job woken with failure)
+    [READ ] LGYRO    = 0o6001
+  ✓ [PASS ] LGYRO = 0o6001 -- NOT cleared by BADEND (THE BUG)
 
-     ✓ [PASS] All future IMUPULSE calls will deadlock at GYROBUSY
+  Phase 5: Demonstrate the consequence: execute IMUPULSE with stuck lock
+  ----------------------------------------------------------
+    [INFO ] Simulating a new gyro operation after the crew uncages the IMU.
+    [INFO ] Redirecting PC to IMUPULSE and stepping through real code...
+    [SET  ] IMODES30 = 0 (IMU uncaged, crew recovered)
+    [SET  ] A = valid ECADR (new gyro torque request)
+    [SET  ] Z -> IMUPULSE (bank 0o7, S-reg 0o3323)
+
+           436 TC	CAGETSTJ	# DONT PROCEED IF IMU BEING CAGED.
+           715 CAGETSTJ	CS	IMODES30	# IF DURING MODE SWITCH INITIALIZATION
+           716 MASK	BIT6		# IT IS FOUND THAT THE IMU IS BEING CAGED,
+           717 CCS	A		# SET IMUCADR TO -0 TO INDICATE OPERATION
+           718 TC	Q		# COMPLETE BUT FAILED.  RETURN IMMEDIATELY
+      >>>  438 CCS	LGYRO		# SEE IF GYROS BUSY.
+      >>>  439 TC	GYROBUSY	# SLEEP.
+      >>>  482 GYROBUSY	EXTEND			# SAVE RETURN 2FCADR.
+           483 DCA	BUF2
+           484 DXCH	MPAC
+      >>>  485 REGSLEEP	CAF	LGWAKE
+
+  ✓ [PASS ] CCS LGYRO found lock held (LGYRO=0o6001) -> branched to GYROBUSY
+  ✓ [PASS ] GYROBUSY reached JOBSLEEP -- job hangs forever (no one will wake it)
+
+    [INFO ] Dead operations (all silent, no alarm, no DSKY error):
+    [INFO ]   P52  IMU realignment (star sighting)
+    [INFO ]   1/GYRO  gyro drift compensation
+    [INFO ]   V49  manual IMU torquing
+
+  Phase 6: The missing fix
+  ----------------------------------------------------------
+
+    [CODE ] STRTGYR2 (normal path) correctly does:
+           521    CAF   ZERO
+           522    TS    LGYRO       # release lock
+
+    [CODE ] BADEND should do the same but doesn't.
+    [CODE ] Fix: add before BADEND's TCF GOODEND+2:
+
+                  CAF   ZERO
+                  TS    LGYRO       # release gyro lock on error path
+
+    [INFO ] Two instructions. Four bytes.
+    [INFO ] Missing across every Apollo mission, for 57 years.
 
 ================================================================
   RESULT: Bug reproduced successfully
 ================================================================
+
+  Bug:     LGYRO resource lock leak in BADEND
+  File:    IMU_MODE_SWITCHING_ROUTINES.agc:728
+  Cause:   BADEND clears MODECADR but not LGYRO
+  Trigger: IMU cage during active gyro torquing
+  Effect:  All gyro operations silently hang forever
+  Fix:     Add CAF ZERO / TS LGYRO to BADEND
 ```
+
+## Verifying the Fix
+
+You can also verify that the proposed two-instruction fix resolves the bug.
+This patches the actual AGC source, reassembles with yaYUL, and confirms
+LGYRO is properly released and IMUPULSE proceeds without deadlocking:
+
+```bash
+python3 reproduce_lgyro_bug.py --verify-fix
+```
+
+The source is automatically reverted to the original (buggy) Luminary099
+after verification.
 
 ## Repository Structure
 
