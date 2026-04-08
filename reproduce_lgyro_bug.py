@@ -324,6 +324,8 @@ def run():
         lgyro_val = dbg.read_var("LGYRO")
         all_pass &= print_check(took_gyrobusy_branch,
             f"CCS LGYRO found lock held (LGYRO={oct(lgyro_val)}) -> branched to GYROBUSY")
+        all_pass &= print_check(reached_gyrobusy,
+            "GYROBUSY reached (lock is still held from BADEND's missed cleanup)")
         all_pass &= print_check(reached_jobsleep,
             "GYROBUSY reached JOBSLEEP/REGSLEEP -- job hangs forever (no one will wake it)")
 
