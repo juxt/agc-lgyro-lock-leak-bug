@@ -376,6 +376,11 @@ def run():
 
 def patch_source(apply_fix):
     """Patch BADEND in the AGC source and reassemble. Returns True on success."""
+    if not os.path.isfile(YAYUL) or not os.access(YAYUL, os.X_OK):
+        print(f"ERROR: yaYUL assembler not found or not executable at {YAYUL}")
+        print("Run ./build.sh first.")
+        return False
+
     with open(IMU_SOURCE, "r") as f:
         source = f.read()
 
@@ -398,10 +403,14 @@ def patch_source(apply_fix):
         f.write(source)
 
     # Reassemble
-    result = subprocess.run(
-        [YAYUL, "--force", "MAIN.agc"],
-        cwd=LUMINARY_DIR,
-        capture_output=True, text=True, timeout=120)
+    try:
+        result = subprocess.run(
+            [YAYUL, "--force", "MAIN.agc"],
+            cwd=LUMINARY_DIR,
+            capture_output=True, text=True, timeout=120)
+    except OSError as e:
+        print(f"ERROR: Failed to run yaYUL: {e}")
+        return False
     if result.returncode != 0:
         print(f"ERROR: yaYUL failed:\n{result.stderr}")
         return False
