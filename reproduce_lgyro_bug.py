@@ -325,7 +325,7 @@ def run():
         all_pass &= print_check(took_gyrobusy_branch,
             f"CCS LGYRO found lock held (LGYRO={oct(lgyro_val)}) -> branched to GYROBUSY")
         all_pass &= print_check(reached_jobsleep,
-            "GYROBUSY reached JOBSLEEP -- job hangs forever (no one will wake it)")
+            "GYROBUSY reached JOBSLEEP/REGSLEEP -- job hangs forever (no one will wake it)")
 
         print()
         print_line("INFO", "Dead operations (all silent, no alarm, no DSKY error):")
