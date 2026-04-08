@@ -550,9 +550,13 @@ def verify_fix():
         if dbg:
             dbg.close()
         # Revert the source
-        patch_source(apply_fix=False)
-        print()
-        print_line("OK", "Reverted source to original (buggy) Luminary099")
+        if patch_source(apply_fix=False):
+            print()
+            print_line("OK", "Reverted source to original (buggy) Luminary099")
+        else:
+            print()
+            print_line("FAIL",
+                "Failed to revert source -- repo may be left in patched state")
 
     print()
     w = 64
