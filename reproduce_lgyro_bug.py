@@ -408,7 +408,7 @@ def patch_source(apply_fix):
 
     # Check for errors
     for line in result.stdout.splitlines():
-        if "Fatal errors:" in line and "0" not in line.split(":")[-1]:
+        if "Fatal errors:" in line and int(line.split(":")[-1].strip()) != 0:
             print(f"ERROR: Assembly errors: {line}")
             return False
     return True
