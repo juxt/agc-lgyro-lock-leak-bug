@@ -47,7 +47,7 @@ The script drives `yaAGC` (the Virtual AGC emulator) in debug mode:
 
 ```bash
 git clone --recurse-submodules <this-repo>
-cd agc
+cd agc-lgyro-lock-leak-bug
 ./build.sh
 python3 reproduce_lgyro_bug.py
 ```
@@ -193,7 +193,7 @@ after verification.
 ## Repository Structure
 
 ```
-agc/
+agc-lgyro-lock-leak-bug/
   reproduce_lgyro_bug.py   # Main reproducer script
   build.sh                 # Builds yaAGC + assembles Luminary099
   README.md                # This file
