@@ -16,6 +16,7 @@ the lock leak in real time.
 
 import os
 import re
+import subprocess
 import sys
 
 import pexpect
@@ -23,9 +24,22 @@ import pexpect
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VIRTUALAGC_DIR = os.path.join(SCRIPT_DIR, "virtualagc")
 YAAGC = os.path.join(VIRTUALAGC_DIR, "yaAGC", "yaAGC")
-LUMINARY_BIN = os.path.join(VIRTUALAGC_DIR, "Luminary099", "MAIN.agc.bin")
-LUMINARY_SYM = os.path.join(VIRTUALAGC_DIR, "Luminary099", "MAIN.agc.symtab")
+YAYUL = os.path.join(VIRTUALAGC_DIR, "yaYUL", "yaYUL")
+LUMINARY_DIR = os.path.join(VIRTUALAGC_DIR, "Luminary099")
+LUMINARY_BIN = os.path.join(LUMINARY_DIR, "MAIN.agc.bin")
+LUMINARY_SYM = os.path.join(LUMINARY_DIR, "MAIN.agc.symtab")
+IMU_SOURCE = os.path.join(LUMINARY_DIR, "IMU_MODE_SWITCHING_ROUTINES.agc")
 AGC_PORT = 19847
+
+BADEND_BUGGY = ("BADEND\t\tTS\tRUPTREG2\t# DEVICE INDEX.\n"
+                "\t\tCS\tZERO\t\t# FOR FAILURE.\n"
+                "\t\tTCF\tGOODEND +2")
+
+BADEND_FIXED = ("BADEND\t\tTS\tRUPTREG2\t# DEVICE INDEX.\n"
+                "\t\tCAF\tZERO\t\t# RELEASE GYRO LOCK ON ERROR PATH.\n"
+                "\t\tTS\tLGYRO\n"
+                "\t\tCS\tZERO\t\t# FOR FAILURE.\n"
+                "\t\tTCF\tGOODEND +2")
 
 PROMPT = r'\(agc\) '
 
@@ -93,6 +107,27 @@ class AgcDebug:
         out = self.command(f"sym-dump {symbol}")
         return out.strip()
 
+    def resolve_fixed_addr(self, symbol):
+        """Resolve a fixed-memory symbol to (bank, sreg) via sym-dump.
+        Returns (bank_octal, sreg_octal) for use with set_pc_to."""
+        out = self.sym_dump(f"^{symbol}$")
+        # Format: "07,3351" for bank 07, S-register 3351 octal
+        m = re.search(r'(\d+),(\d+)', out)
+        if not m:
+            raise ValueError(f"Could not resolve symbol {symbol}: {out!r}")
+        bank = int(m.group(1), 8)
+        sreg = int(m.group(2), 8)
+        return (bank, sreg)
+
+    def set_pc_to(self, bank, sreg):
+        """Set the program counter to a fixed-switchable address.
+        bank: bank number (integer), sreg: S-register address (integer, octal range 02000-03777)."""
+        fb = bank << 10
+        bb = fb | 0x06  # EBANK doesn't matter much, use 6 as existing code does
+        self.write_register(4, fb)      # FB
+        self.write_register(6, bb)      # BB
+        self.write_register(5, sreg)    # Z = S-register
+
     def close(self):
         self.child.terminate(force=True)
         self.child.wait()
@@ -123,7 +158,7 @@ def print_trace(line_num, text, highlight=False):
 def print_check(ok, msg, indent=4):
     marker = "\u2713" if ok else "\u2717"
     status = "PASS" if ok else "FAIL"
-    print(f"{'':{indent}s} {marker} [{status}] {msg}")
+    print(f"{'':{indent - 2}s}{marker} [{status:5s}] {msg}")
     return ok
 
 
@@ -232,27 +267,65 @@ def run():
             f"LGYRO = {oct(lgyro_after)} -- NOT cleared by BADEND (THE BUG)")
 
         # ── Phase 5 ─────────────────────────────────────────────
-        print_phase(5, "Demonstrate the consequence: permanent deadlock")
+        print_phase(5, "Demonstrate the consequence: execute IMUPULSE with stuck lock")
 
-        print_line("INFO", "Any future call to IMUPULSE now does:")
+        print_line("INFO", "Simulating a new gyro operation after the crew uncages the IMU.")
+        print_line("INFO", "Redirecting PC to IMUPULSE and stepping through real code...")
+
+        # Clear the cage bit — crew has uncaged the IMU
+        dbg.write_var("IMODES30", 0)
+        print_line("SET", "IMODES30 = 0 (IMU uncaged, crew recovered)")
+
+        # Set A register to a valid ECADR (needed by IMUPULSE's first TS)
+        dbg.write_register(0, 0x0040)  # A = some valid ECADR
+        print_line("SET", "A = valid ECADR (new gyro torque request)")
+
+        # Resolve IMUPULSE address and redirect PC there
+        imp_bank, imp_sreg = dbg.resolve_fixed_addr("IMUPULSE")
+        dbg.set_pc_to(imp_bank, imp_sreg)
+        print_line("SET", f"Z -> IMUPULSE (bank {oct(imp_bank)}, S-reg {oct(imp_sreg)})")
         print()
-        print_trace("", "IMUPULSE:")
-        print_trace("435", "   TS    MPAC+5")
-        print_trace("436", "   TC    CAGETSTJ    # check cage")
-        print_trace("438", "   CCS   LGYRO       # test the lock")
+
+        # Step through IMUPULSE and watch it hit GYROBUSY -> JOBSLEEP
+        reached_gyrobusy = False
+        reached_jobsleep = False
+        took_gyrobusy_branch = False
+        max_steps = 25
+        for i in range(max_steps):
+            lines = dbg.step_one()
+            for l in lines:
+                highlight = False
+                if "GYROBUSY" in l:
+                    reached_gyrobusy = True
+                    highlight = True
+                if "JOBSLEEP" in l or "REGSLEEP" in l:
+                    reached_jobsleep = True
+                    highlight = True
+                if "CCS" in l and "LGYRO" in l:
+                    highlight = True
+                if "TC" in l and "GYROBUSY" in l:
+                    took_gyrobusy_branch = True
+                    highlight = True
+
+                m = re.match(r'(\w+)\s+\(\)\s+at\s+(\S+):(\d+)', l)
+                if m:
+                    print_trace("", f"--- entered {m.group(1)} ({m.group(2)}) ---",
+                                highlight=("GYROBUSY" in l))
+                    continue
+
+                m2 = re.match(r'(\d+)\s+(.*)', l)
+                if m2:
+                    print_trace(m2.group(1), m2.group(2), highlight=highlight)
+
+            if reached_jobsleep:
+                break
+
+        print()
         lgyro_val = dbg.read_var("LGYRO")
-        if lgyro_val != 0:
-            print_trace("439", f"   TC    GYROBUSY    # LGYRO={oct(lgyro_val)} != 0 -> TAKEN", highlight=True)
-            print()
-            print_trace("", "GYROBUSY:")
-            print_trace("482", "   TC    JOBSLEEP    # sleep until LGYRO freed", highlight=True)
-            print_trace("", "   ... but STRTGYR2 will never run ...", highlight=True)
-            print_trace("", "   ... so JOBWAKE never fires ...", highlight=True)
-            print_trace("", "   ... job sleeps FOREVER", highlight=True)
-        print()
-
-        all_pass &= print_check(lgyro_val != 0,
-            "All future IMUPULSE calls will deadlock at GYROBUSY")
+        all_pass &= print_check(took_gyrobusy_branch,
+            f"CCS LGYRO found lock held (LGYRO={oct(lgyro_val)}) -> branched to GYROBUSY")
+        all_pass &= print_check(reached_jobsleep,
+            "GYROBUSY reached JOBSLEEP -- job hangs forever (no one will wake it)")
 
         print()
         print_line("INFO", "Dead operations (all silent, no alarm, no DSKY error):")
@@ -301,5 +374,189 @@ def run():
     return 0 if all_pass else 1
 
 
+def patch_source(apply_fix):
+    """Patch BADEND in the AGC source and reassemble. Returns True on success."""
+    with open(IMU_SOURCE, "r") as f:
+        source = f.read()
+
+    if apply_fix:
+        if BADEND_FIXED in source:
+            return True  # already patched
+        if BADEND_BUGGY not in source:
+            print("ERROR: Could not find BADEND buggy pattern in source")
+            return False
+        source = source.replace(BADEND_BUGGY, BADEND_FIXED, 1)
+    else:
+        if BADEND_BUGGY in source:
+            return True  # already original
+        if BADEND_FIXED not in source:
+            print("ERROR: Could not find BADEND fixed pattern in source")
+            return False
+        source = source.replace(BADEND_FIXED, BADEND_BUGGY, 1)
+
+    with open(IMU_SOURCE, "w") as f:
+        f.write(source)
+
+    # Reassemble
+    result = subprocess.run(
+        [YAYUL, "--force", "MAIN.agc"],
+        cwd=LUMINARY_DIR,
+        capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        print(f"ERROR: yaYUL failed:\n{result.stderr}")
+        return False
+
+    # Check for errors
+    for line in result.stdout.splitlines():
+        if "Fatal errors:" in line and "0" not in line.split(":")[-1]:
+            print(f"ERROR: Assembly errors: {line}")
+            return False
+    return True
+
+
+def verify_fix():
+    """Apply the fix, reassemble, and verify the bug is gone."""
+    print_header("LGYRO Fix Verification\n  Patching BADEND and reassembling Luminary099")
+
+    all_pass = True
+    dbg = None
+
+    try:
+        # ── Patch and rebuild ───────────────────────────────────
+        print_phase(1, "Apply fix to BADEND and reassemble")
+        if not patch_source(apply_fix=True):
+            return 1
+        print_line("OK", "Patched BADEND: added CAF ZERO / TS LGYRO")
+        print_line("OK", "Reassembled Luminary099 with fix")
+
+        # ── Boot ────────────────────────────────────────────────
+        print_phase(2, "Boot patched AGC and set up bug scenario")
+        dbg = AgcDebug()
+        dbg.step(5000)
+        print_line("OK", "yaAGC running with patched Luminary099")
+
+        dbg.write_var("LGYRO", 0o06001)
+        dbg.write_var("IMODES30", 0o40)
+        dbg.write_var("MODECADR", 0o100)
+        imp_bank, imp_sreg = dbg.resolve_fixed_addr("STRTGYRO")
+        dbg.set_pc_to(imp_bank, imp_sreg)
+        print_line("SET", "Same pre-conditions as bug repro (LGYRO held, IMU caged)")
+        print_line("SET", "Z -> STRTGYRO")
+
+        # ── Execute BADEND (now with fix) ───────────────────────
+        print_phase(3, "Execute STRTGYRO -> CAGETEST -> patched BADEND")
+        print_line("INFO", "Stepping through patched code...")
+        print()
+
+        badend_done = False
+        for i in range(40):
+            lines = dbg.step_one()
+            for l in lines:
+                highlight = False
+                if "LGYRO" in l:
+                    highlight = True
+                if "BADEND" in l:
+                    highlight = True
+                if "TASKOVER" in l or "JOBWAKE" in l:
+                    badend_done = True
+
+                m = re.match(r'(\w+)\s+\(\)\s+at\s+(\S+):(\d+)', l)
+                if m:
+                    print_trace("", f"--- entered {m.group(1)} ---",
+                                highlight=("BADEND" in l))
+                    continue
+                m2 = re.match(r'(\d+)\s+(.*)', l)
+                if m2:
+                    print_trace(m2.group(1), m2.group(2), highlight=highlight)
+            if badend_done:
+                break
+
+        print()
+
+        # ── Check state ────────────────────────────────────────
+        print_phase(4, "Inspect state after patched BADEND")
+
+        lgyro_after = dbg.read_var("LGYRO")
+        modecadr_after = dbg.read_var("MODECADR")
+
+        print_line("READ", f"MODECADR = {oct(modecadr_after)}")
+        all_pass &= print_check(modecadr_after == 0,
+            "MODECADR cleared by BADEND")
+
+        print_line("READ", f"LGYRO    = {oct(lgyro_after)}")
+        all_pass &= print_check(lgyro_after == 0,
+            "LGYRO cleared by patched BADEND (fix works!)")
+
+        # ── Verify IMUPULSE proceeds ────────────────────────────
+        print_phase(5, "Verify IMUPULSE proceeds normally (no deadlock)")
+
+        dbg.write_var("IMODES30", 0)
+        dbg.write_register(0, 0x0040)
+        imp_bank, imp_sreg = dbg.resolve_fixed_addr("IMUPULSE")
+        dbg.set_pc_to(imp_bank, imp_sreg)
+        print_line("SET", "Z -> IMUPULSE (IMU uncaged, LGYRO free)")
+        print()
+
+        passed_ccs = False
+        reached_gyrobusy = False
+        proceeded_normally = False
+        for i in range(25):
+            lines = dbg.step_one()
+            for l in lines:
+                highlight = False
+                if "CCS" in l and "LGYRO" in l:
+                    passed_ccs = True
+                    highlight = True
+                if "GYROBUSY" in l:
+                    reached_gyrobusy = True
+                if "MPAC" in l and "TS" in l and passed_ccs:
+                    proceeded_normally = True
+                    highlight = True
+                if "WAITLIST" in l:
+                    proceeded_normally = True
+
+                m = re.match(r'(\w+)\s+\(\)\s+at\s+(\S+):(\d+)', l)
+                if m:
+                    print_trace("", f"--- entered {m.group(1)} ---",
+                                highlight=False)
+                    continue
+                m2 = re.match(r'(\d+)\s+(.*)', l)
+                if m2:
+                    print_trace(m2.group(1), m2.group(2), highlight=highlight)
+
+            if proceeded_normally:
+                break
+
+        print()
+        all_pass &= print_check(passed_ccs,
+            "CCS LGYRO executed")
+        all_pass &= print_check(not reached_gyrobusy,
+            "GYROBUSY NOT reached (lock is free)")
+        all_pass &= print_check(proceeded_normally,
+            "IMUPULSE proceeded to schedule gyro torque normally")
+
+    finally:
+        if dbg:
+            dbg.close()
+        # Revert the source
+        patch_source(apply_fix=False)
+        print()
+        print_line("OK", "Reverted source to original (buggy) Luminary099")
+
+    print()
+    w = 64
+    print("=" * w)
+    if all_pass:
+        print("  RESULT: Fix verified -- BADEND now releases LGYRO")
+    else:
+        print("  RESULT: Fix verification failed (see above)")
+    print("=" * w)
+    print()
+
+    return 0 if all_pass else 1
+
+
 if __name__ == "__main__":
+    if "--verify-fix" in sys.argv:
+        sys.exit(verify_fix())
     sys.exit(run())
